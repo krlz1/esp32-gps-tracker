@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>GPS Tracker Realtime</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <!-- Leaflet CSS & JS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+
+    <!-- Library MQTT Browser (Paho MQTT via WebSocket) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.0.1/mqttws31.min.js"></script>
+
+    <style>
+        body { margin: 0; font-family: Arial, sans-serif; }
+        #map { height: 75vh; }
+        .card { padding: 15px; font-size: 16px; line-height: 1.6; }
+    </style>
+</head>
+<body>
+
+    <div id="map"></div>
+
+    <div class="card">
+        <h3>📍 GPS Tracker Realtime</h3>
+        <b>Device ID:</b> <span id="device_id">-</span><br>
+        <b>Latitude:</b> <span id="lat">0</span><br>
+        <b>Longitude:</b> <span id="lng">0</span><br>
+        <b>Battery:</b> <span id="battery">0</span>%<br>
+        <b>Satellite:</b> <span id="sat">0</span><br>
+        <b>Speed:</b> <span id="speed">0</span> km/h<br>
+        <b>Altitude:</b> <span id="alt">0</span> m<br>
+        <b>Status:</b> <span id="status">offline</span>
+    </div>
+
+    <script>
+        // 1. Inisialisasi Peta Leaflet
+        var map = L.map('map').setView([-6.964, 107.671], 16);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+        var marker = L.marker([-6.964, 107.671]).addTo(map);
+
+        // 2. Konfigurasi MQTT Broker (HiveMQ WebSocket Port 8000 / 8884)
+        var brokerHost = "broker.hivemq.com";
+        var brokerPort = 8000; // Port WebSocket untuk HiveMQ
+        var topicName  = "esp32/gps_data"; // Sesuaikan topik ESP32 kamu
+        var clientId   = "web_client_" + Math.random().toString(16).substr(2, 8);
+
+        // 3. Buat Client MQTT
+        var client = new Paho.MQTT.Client(brokerHost, Number(brokerPort), clientId);
+
+        // Handler saat koneksi terputus
+        client.onConnectionLost = function (responseObject) {
+            console.log("Koneksi MQTT Terputus:", responseObject.errorMessage);
+            document.getElementById("status").innerHTML = "offline";
+        };
+
+        // Handler saat pesan baru masuk dari ESP32
+        client.onMessageArrived = function (message) {
+            console.log("Data MQTT Masuk:", message.payloadString);
+            try {
+                // Parse JSON dari ESP32
+                var data = JSON.parse(message.payloadString);
+
+                // Update teks di HTML
+                if (data.device_id) document.getElementById("device_id").innerHTML = data.device_id;
+                document.getElementById("lat").innerHTML = data.latitude;
+                document.getElementById("lng").innerHTML = data.longitude;
+                document.getElementById("battery").innerHTML = data.battery_level;
+                document.getElementById("sat").innerHTML = data.satellites || 0;
+                document.getElementById("speed").innerHTML = Number(data.speed || 0).toFixed(2);
+                document.getElementById("alt").innerHTML = Number(data.altitude || 0).toFixed(2);
+                document.getElementById("status").innerHTML = data.status || "online";
+
+                // Update posisi Marker Peta jika koordinat valid
+                if (data.latitude !== 0 && data.longitude !== 0) {
+                    marker.setLatLng([data.latitude, data.longitude]);
+                    map.panTo([data.latitude, data.longitude]);
+                }
+            } catch (e) {
+                console.error("Gagal parse JSON:", e);
+            }
+        };
+
+        // 4. Hubungkan ke Broker
+        client.connect({
+            onSuccess: function () {
+                console.log("Berhasil Terhubung Langsung ke Broker MQTT HiveMQ!");
+                client.subscribe(topicName); // Subscribe topik ESP32
+            },
+            onFailure: function (message) {
+                console.log("Gagal konek MQTT:", message.errorMessage);
+            }
+        });
+    </script>
+</body>
+</html>
