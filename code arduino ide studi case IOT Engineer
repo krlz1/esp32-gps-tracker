@@ -1,0 +1,295 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <TinyGPS++.h>
+#include <time.h>
+#include <esp_task_wdt.h>
+
+// ================= WIFI CONFIGURATION =================
+const char* ssid     = "fh_943370";
+const char* password = "wlan6bcc8f";
+
+// ================= MQTT CONFIGURATION =================
+const char* broker       = "broker.hivemq.com";
+const uint16_t mqtt_port = 1883;
+
+const char* publish_topic = "esp32/gps_data";
+const char* status_topic  = "esp32/status";
+const char* device_id     = "gps001";
+
+// ================= GPS CONFIGURATION (NEO-M8U) =================
+#define GPS_RX_PIN 33  // Colok ke pin TX Modul NEO-M8U
+#define GPS_TX_PIN 32  // Colok ke pin RX Modul NEO-M8U
+#define GPS_BAUD   9600 // Default Baudrate NEO-M8U
+
+TinyGPSPlus gps;
+HardwareSerial SerialGPS(2);
+
+// ================= NETWORK & TIMER OBJECTS =================
+WiFiClient espClient;
+PubSubClient mqtt(espClient);
+
+unsigned long lastPublish = 0;
+const unsigned long publishInterval = 10000; // Kirim tiap 10 detik
+
+// ================= GPS DATA VARIABLES =================
+double latitude = 0.0;
+double longitude = 0.0;
+bool gpsFix = false;
+
+// ================= DEVICE VARIABLES =================
+int batteryLevel = 100;
+String deviceStatus = "online";
+
+// ================= JSON & BUFFER =================
+StaticJsonDocument<512> doc;
+
+#define BUFFER_SIZE 20
+String offlineBuffer[BUFFER_SIZE];
+uint8_t bufferIndex = 0;
+
+// ================= NTP TIME SYNC =================
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 7 * 3600; // GMT+7 (WIB)
+const int daylightOffset_sec = 0;
+
+// ================= WATCHDOG TIMER =================
+#define WDT_TIMEOUT 30
+
+// ================= BATTERY CONFIGURATION =================
+// Gunakan pin ADC (misalnya GPIO34) untuk membaca tegangan baterai
+#define BATTERY_PIN 34
+
+// Forward Declarations
+void setup_wifi();
+void syncTime();
+void reconnect();
+void get_gps_data();
+void saveOfflineBuffer(const char *payload);
+void sendOfflineBuffer();
+int getBatteryLevel();
+String getStatus();
+unsigned long getTimestamp();
+void initWatchdog();
+void resetWatchdog();
+
+// ================= MQTT CALLBACK =================
+void callback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("Message arrived [");
+  Serial.print(topic);
+  Serial.print("] : ");
+  for (unsigned int i = 0; i < length; i++) {
+    Serial.print((char)payload[i]);
+  }
+  Serial.println();
+}
+
+// ================= WATCHDOG TIMER =================
+void initWatchdog() {
+#if ESP_IDF_VERSION_MAJOR >= 5
+  esp_task_wdt_config_t config = {
+    .timeout_ms = WDT_TIMEOUT * 1000,
+    .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
+    .trigger_panic = true
+  };
+  esp_task_wdt_init(&config);
+#else
+  esp_task_wdt_init(WDT_TIMEOUT, true);
+#endif
+  esp_task_wdt_add(NULL);
+}
+
+void resetWatchdog() {
+  esp_task_wdt_reset();
+}
+
+// ================= WIFI CONNECT =================
+void setup_wifi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  Serial.println("\nConnecting WiFi...");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    resetWatchdog();
+    attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi Connected!");
+    Serial.print("IP Address : ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nWiFi Connection Failed! Moving to offline mode...");
+  }
+}
+
+// ================= NTP TIME SYNC =================
+void syncTime() {
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  Serial.print("Syncing Time via NTP");
+
+  struct tm timeinfo;
+  int attempts = 0;
+  while (!getLocalTime(&timeinfo) && attempts < 10) {
+    Serial.print(".");
+    delay(500);
+    resetWatchdog();
+    attempts++;
+  }
+
+  if (attempts < 10) {
+    Serial.println("\nTime Synced Successfully");
+  } else {
+    Serial.println("\nTime Sync Timeout!");
+  }
+}
+
+// ================= MQTT CONNECT =================
+void reconnect() {
+  if (!mqtt.connected() && WiFi.status() == WL_CONNECTED) {
+    Serial.print("Connecting MQTT Broker...");
+    if (mqtt.connect(device_id)) {
+      Serial.println("Connected");
+      mqtt.subscribe(status_topic);
+      mqtt.publish(status_topic, "online");
+      sendOfflineBuffer(); // Kirim data tersimpan saat koneksi terhubung
+    } else {
+      Serial.print("Failed RC = ");
+      Serial.println(mqtt.state());
+    }
+  }
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+
+  // Inisialisasi Hardware Serial 2 untuk GPS NEO-M8U
+  SerialGPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+
+  initWatchdog();
+  setup_wifi();
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    syncTime();
+  }
+
+  mqtt.setServer(broker, mqtt_port);
+  mqtt.setCallback(callback);
+
+  randomSeed(analogRead(0));
+  Serial.println("System Ready. Waiting for GPS data...");
+}
+
+// ================= LOOP =================
+void loop() {
+  resetWatchdog(); // Reset Watchdog Timer
+
+  // 1. Baca data GPS continuous dari NEO-M8U
+  while (SerialGPS.available() > 0) {
+    char c = SerialGPS.read();
+    gps.encode(c);
+  }
+
+  // 2. Jaga koneksi WiFi & MQTT secara non-blocking
+  if (WiFi.status() != WL_CONNECTED) {
+    setup_wifi();
+  } else if (!mqtt.connected()) {
+    reconnect();
+  }
+
+  mqtt.loop();
+
+  // 3. Proses dan Publish Data sesuai interval
+  if (millis() - lastPublish >= publishInterval) {
+    lastPublish = millis();
+    get_gps_data();
+  }
+}
+
+// ================= GPS & MQTT PROCESSING =================
+void get_gps_data() {
+  Serial.println("\n========== GPS DATA ==========");
+
+  if (gps.location.isValid()) {
+    gpsFix    = true;
+    latitude  = gps.location.lat();
+    longitude = gps.location.lng();
+
+    Serial.print("Latitude  : ");
+    Serial.println(latitude, 6);
+    Serial.print("Longitude : ");
+    Serial.println(longitude, 6);
+  } else {
+    gpsFix = false;
+    Serial.println("GPS INVALID (Mencari Sinyal Satelit/Kalibrasi M8U...)");
+  }
+
+  batteryLevel = getBatteryLevel();
+  deviceStatus = getStatus();
+
+  // Susun Payload JSON
+  doc.clear();
+  doc["device_id"]     = device_id;
+  doc["timestamp"]     = getTimestamp();
+  doc["latitude"]      = latitude;
+  doc["longitude"]     = longitude;
+  doc["battery_level"] = batteryLevel;
+  doc["status"]        = deviceStatus;
+  doc["gps_fix"]       = gpsFix;
+  doc["satellites"]    = gps.satellites.value();
+  doc["hdop"]          = gps.location.isValid() ? gps.hdop.value() / 100.0 : 0.0;
+  doc["speed"]         = gps.speed.kmph();
+  doc["altitude"]      = gps.altitude.meters();
+  doc["wifi_rssi"]     = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
+
+  char payload[512];
+  serializeJson(doc, payload);
+
+  Serial.print("Payload JSON: ");
+  Serial.println(payload);
+
+  // Kirim data atau simpan ke offline buffer
+  if (WiFi.status() == WL_CONNECTED && mqtt.connected()) {
+    bool result = mqtt.publish(publish_topic, payload);
+    if (result) {
+      Serial.println("Publish Success -> MQTT Broker");
+    } else {
+      Serial.println("Publish Failed -> Storing to Offline Buffer");
+      saveOfflineBuffer(payload);
+    }
+  } else {
+    Serial.println("Offline Mode -> Storing to Offline Buffer");
+    saveOfflineBuffer(payload);
+  }
+}
+
+// ================= SAVE OFFLINE DATA =================
+void saveOfflineBuffer(const char *payload) {
+  if (bufferIndex >= BUFFER_SIZE) {
+    // Buffer penuh, geser data paling lama
+    for (int i = 1; i < BUFFER_SIZE; i++) {
+      offlineBuffer[i - 1] = offlineBuffer[i];
+    }
+    bufferIndex = BUFFER_SIZE - 1;
+  }
+
+  offlineBuffer[bufferIndex] = String(payload);
+  bufferIndex++;
+  Serial.print("Offline Buffer Stored. Total items in buffer: ");
+  Serial.println(bufferIndex);
+}
+
+// ================= SEND BUFFER DATA =================
+void sendOfflineBuffer() {
+  if (bufferIndex == 0) return;
+
+  Serial.println("Sending Offline Buffer Data...");
+  int i = 0;
+  while (i < bufferIndex) {
+    if (mqtt
