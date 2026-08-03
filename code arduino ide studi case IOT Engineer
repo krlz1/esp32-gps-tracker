@@ -21,6 +21,7 @@ const char* device_id     = "gps001";
 #define GPS_RX_PIN 33  // Colok ke pin TX Modul NEO-M8U
 #define GPS_TX_PIN 32  // Colok ke pin RX Modul NEO-M8U
 #define GPS_BAUD   9600 // Default Baudrate NEO-M8U
+#define BATTERY_PIN 25
 
 TinyGPSPlus gps;
 HardwareSerial SerialGPS(2);
@@ -55,10 +56,6 @@ const int daylightOffset_sec = 0;
 
 // ================= WATCHDOG TIMER =================
 #define WDT_TIMEOUT 30
-
-// ================= BATTERY CONFIGURATION =================
-// Gunakan pin ADC (misalnya GPIO34) untuk membaca tegangan baterai
-#define BATTERY_PIN 34
 
 // Forward Declarations
 void setup_wifi();
@@ -172,6 +169,8 @@ void setup() {
   // Inisialisasi Hardware Serial 2 untuk GPS NEO-M8U
   SerialGPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
 
+  pinMode(BATTERY_PIN, INPUT);
+
   initWatchdog();
   setup_wifi();
   
@@ -243,7 +242,11 @@ void get_gps_data() {
   doc["status"]        = deviceStatus;
   doc["gps_fix"]       = gpsFix;
   doc["satellites"]    = gps.satellites.value();
-  doc["hdop"]          = gps.location.isValid() ? gps.hdop.value() / 100.0 : 0.0;
+  if (gps.location.isValid()) {
+  doc["hdop"] = gps.hdop.value() / 100.0;
+} else {
+  doc["hdop"] = 0.0; // atau bisa diganti 99.99 / nullptr jika ingin menandakan invalid
+}
   doc["speed"]         = gps.speed.kmph();
   doc["altitude"]      = gps.altitude.meters();
   doc["wifi_rssi"]     = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
@@ -292,4 +295,60 @@ void sendOfflineBuffer() {
   Serial.println("Sending Offline Buffer Data...");
   int i = 0;
   while (i < bufferIndex) {
-    if (mqtt
+    if (mqtt.publish(publish_topic, offlineBuffer[i].c_str())) {
+      Serial.print("Buffer Sent ");
+      Serial.println(i + 1);
+
+      for (int j = i + 1; j < bufferIndex; j++) {
+        offlineBuffer[j - 1] = offlineBuffer[j];
+      }
+      bufferIndex--;
+    } else {
+      Serial.println("Failed to Send Buffer");
+      break;
+    }
+  }
+}
+
+// ================= HELPER FUNCTIONS =================
+int getBatteryLevel() {
+
+  int adc = analogRead(BATTERY_PIN);
+
+  // Tegangan ADC ESP32
+  float voltage = (adc * 3.3) / 4095.0;
+
+  // Jika menggunakan voltage divider 100K : 100K
+  voltage *= 2.0;
+
+  // Konversi tegangan menjadi persen
+  int percent = map((int)(voltage * 100), 320, 420, 0, 100);
+
+  percent = constrain(percent, 0, 100);
+
+  Serial.print("ADC          : ");
+  Serial.println(adc);
+
+  Serial.print("Voltage      : ");
+  Serial.print(voltage, 2);
+  Serial.println(" V");
+
+  Serial.print("Battery      : ");
+  Serial.print(percent);
+  Serial.println(" %");
+
+  return percent;
+}
+
+String getStatus() {
+  if (WiFi.status() == WL_CONNECTED && mqtt.connected()) return "online";
+  if (WiFi.status() != WL_CONNECTED) return "offline";
+  return "error";
+}
+
+unsigned long getTimestamp() {
+  time_t now;
+  time(&now);
+  if (now < 100000) return millis() / 1000;
+  return (unsigned long)now;
+}
